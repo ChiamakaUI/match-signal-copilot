@@ -97,6 +97,24 @@ test("no-cross-frame-leak: a later frame omitting event/id does not inherit the 
   );
 });
 
+test("dataless-frame-no-leak: a data-less event/id frame leaks nothing into the next data-only frame", () => {
+  const parser = new SseParser();
+  // Frame 1 carries `event:` and `id:` but NO `data:`, so it dispatches nothing
+  // AND leaves hasData=false. Frame 2 supplies ONLY data. The distinguishing
+  // property: a parser that resets eventName/id only INSIDE `if (this.hasData)`
+  // never runs the reset for frame 1 (hasData is false), so frame 1's
+  // "leaked"/"99" bleed into frame 2. Every same-value / data-carrying multi-
+  // frame test misses this exact variant of the cross-frame-leak class.
+  const events = parser.write("event: leaked\nid: 99\n\ndata: b\n\n");
+
+  assert.equal(events.length, 1, `expected 1 event, got ${events.length}`);
+  assert.deepEqual(
+    events[0],
+    { data: "b" },
+    "the data-only frame must NOT inherit the prior data-less frame's event 'leaked' / id '99'",
+  );
+});
+
 test("partial-chunk: a frame split mid-field parses to exactly one event after the second chunk", () => {
   const parser = new SseParser();
 
