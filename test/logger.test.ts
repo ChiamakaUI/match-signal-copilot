@@ -120,3 +120,45 @@ test("logger: structured fields are merged into the JSON object", () => {
   assert.equal(parsed.level, "info", "level must survive field merge");
   assert.equal(parsed.msg, "request handled", "msg must survive field merge");
 });
+
+test("logger: caller-supplied fields can NOT override the true level/msg/time", () => {
+  // Distinguishing test for the field-merge ORDER. The correct impl spreads
+  // caller fields FIRST so the real level/msg/time win. A reversed-order impl
+  // (`{ level, time, msg, ...fields }`) would let a caller clobber those core
+  // fields — a security/correctness hazard (a debug call could masquerade as an
+  // error line, or hide its real timestamp). Passing colliding keys makes the
+  // WRONG value distinct from the RIGHT one, so a reversed impl goes RED here.
+  const frozen = new Date("2020-01-01T00:00:00.000Z");
+  const lines = captureStdout(() => {
+    const log = createLogger({ level: "info", now: () => frozen });
+    log.warn("real message", {
+      level: "SPOOFED_LEVEL",
+      msg: "SPOOFED_MSG",
+      time: "SPOOFED_TIME",
+      // a genuine extra field alongside the collisions must still survive
+      route: "/health",
+    });
+  });
+  assert.equal(lines.length, 1, `expected one line, got ${lines.length}`);
+  const parsed = JSON.parse(lines[0] as string) as Record<string, unknown>;
+  assert.equal(
+    parsed.level,
+    "warn",
+    `level must be the TRUE call level "warn", not the caller override; got ${String(parsed.level)}`,
+  );
+  assert.equal(
+    parsed.msg,
+    "real message",
+    `msg must be the TRUE message, not the caller override; got ${String(parsed.msg)}`,
+  );
+  assert.equal(
+    parsed.time,
+    "2020-01-01T00:00:00.000Z",
+    `time must be the TRUE clock value, not the caller override; got ${String(parsed.time)}`,
+  );
+  assert.equal(
+    parsed.route,
+    "/health",
+    "a non-colliding caller field must still be preserved",
+  );
+});

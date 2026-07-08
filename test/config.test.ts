@@ -75,6 +75,23 @@ test("config_fail_fast: a non-integer PORT (3000.5) throws", () => {
   );
 });
 
+test("config_fail_fast: JS-numeric-but-non-decimal PORT strings (0x10, 1e3, +80) throw", () => {
+  // Distinguishing test for the STRICT decimal guard. A lazy impl that uses
+  // `Number(raw)` + an integer/range check (no `/^\d+$/` regex) would SILENTLY
+  // accept these — `Number("0x10")` === 16, `Number("1e3")` === 1000,
+  // `Number("+80")` === 80 — all in range, all integers, so they'd pass a
+  // range-only check while smuggling a non-canonical port string past the
+  // loader. The strict regex rejects them; asserting each throws makes the
+  // unguarded `Number()` build go RED, per AC #2's proof requirement.
+  for (const bad of ["0x10", "0X1F", "1e3", "1E3", "+80", "0b101", "0o17"]) {
+    assert.throws(
+      () => loadConfig({ PORT: bad }),
+      /PORT/,
+      `PORT="${bad}" must be rejected as a non-decimal string, not coerced`,
+    );
+  }
+});
+
 test("config_fail_fast: an unrecognized LOG_LEVEL throws a descriptive error", () => {
   assert.throws(
     () => loadConfig({ LOG_LEVEL: "verbose" }),
