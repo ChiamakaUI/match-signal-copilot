@@ -11,7 +11,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { startTxlineIngestion } from "../../src/txline/service.ts";
+import {
+  startTxlineIngestion,
+  fetchConnect,
+} from "../../src/txline/service.ts";
 import { EventEmitterSink } from "../../src/txline/sink.ts";
 import type { Logger } from "../../src/logger.ts";
 import type { ConnectRequest } from "../../src/txline/client.ts";
@@ -286,4 +289,92 @@ test("default connect uses the real network boundary (fetch), not a no-op stub",
     `the real default pipeline must deliver the scripted record, got ${received.length}`,
   );
   assert.equal(received[0]?.matchId, "m-77");
+});
+
+test("e2e-backoff -> reconnect delay is computed from the INJECTED backoff config (base, then base*factor)", async () => {
+  // The service forwards `deps.backoff` into the real client, which computes the
+  // reconnect delay as min(cap, base * factor^attempt). Drive two empty (drop)
+  // connections so the loop reconnects twice, and capture the exact `ms` handed
+  // to `sleep`. If the service dropped `backoff` (or forwarded a hard-coded
+  // value) the client would fall back to its 1000ms/factor-2 defaults and the
+  // captured delays would be [1000, 2000], not [7, 21] — so this goes RED.
+  const sink = new EventEmitterSink<NormalizedMatchEvent>();
+  const received: NormalizedMatchEvent[] = [];
+  sink.subscribe((e) => received.push(e));
+
+  const delays: number[] = [];
+
+  let ingestion!: ReturnType<typeof startTxlineIngestion>;
+  ingestion = startTxlineIngestion(sink, {
+    config: CONFIG,
+    logger: noopLogger,
+    backoff: { baseMs: 7, capMs: 999, factor: 3 },
+    sleep: async (ms: number) => {
+      delays.push(ms);
+    },
+    connect: (_req: ConnectRequest) => {
+      // First two connects drop immediately (empty stream) -> backoff grows.
+      // The third delivers a real frame then stops the loop.
+      if (delays.length >= 2) {
+        ingestion.stop();
+        return { chunks: chunkStream(VALID_FRAME) };
+      }
+      return { chunks: chunkStream() };
+    },
+  });
+
+  await ingestion.done;
+
+  assert.deepEqual(
+    delays,
+    [7, 21],
+    `reconnect delays must be computed from the injected backoff (base=7, factor=3 -> [7,21]), got ${JSON.stringify(delays)}`,
+  );
+  // Sanity: the post-backoff connection still delivered end-to-end.
+  assert.equal(
+    received.length,
+    1,
+    `the frame delivered after backoff must reach the sink, got ${received.length}`,
+  );
+  assert.equal(received[0]?.matchId, "m-77");
+});
+
+test("fetchConnect throws on a non-ok HTTP status (status error branch is exercised)", async () => {
+  const req: ConnectRequest = { url: CONFIG.sseUrl, headers: {} };
+  const originalFetch = globalThis.fetch;
+  // A non-ok status WITH a real (non-null) body: only the status guard can
+  // reject this, so deleting or inverting `!response.ok` makes the test RED.
+  globalThis.fetch = (async () =>
+    new Response("upstream unavailable", {
+      status: 503,
+      statusText: "Service Unavailable",
+    })) as typeof fetch;
+  try {
+    await assert.rejects(
+      () => fetchConnect(req),
+      (err: unknown) => err instanceof Error && /HTTP 503/.test(err.message),
+      "fetchConnect must throw on a non-ok status, naming the HTTP code",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("fetchConnect throws when an OK response has no body to stream (null-body branch)", async () => {
+  const req: ConnectRequest = { url: CONFIG.sseUrl, headers: {} };
+  const originalFetch = globalThis.fetch;
+  // status 200 (ok) but a NULL body: passes the status guard and must be
+  // rejected by the body===null guard. Deleting that guard makes this RED
+  // (it would instead resolve with `{ chunks: null }`).
+  globalThis.fetch = (async () =>
+    new Response(null, { status: 200 })) as typeof fetch;
+  try {
+    await assert.rejects(
+      () => fetchConnect(req),
+      (err: unknown) => err instanceof Error && /no body/.test(err.message),
+      "fetchConnect must throw when the OK response has no body",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
