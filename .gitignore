@@ -1,8 +1,23 @@
-__pycache__/
-*.py[cod]
-.venv/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+# Dependencies
+node_modules/
+
+# Build output
 dist/
-*.egg-info/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Test / coverage output
+coverage/
+*.lcov
+.nyc_output/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.DS_Store
