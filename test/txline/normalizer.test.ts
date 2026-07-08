@@ -200,21 +200,71 @@ for (const field of REQUIRED_FIELDS) {
   });
 }
 
-test("skips-wrong-type: a non-string matchId (number) is treated as invalid", () => {
-  const { sink, received } = harness();
-  const logger = spyLogger();
-  const normalize = createNormalizer({ sink, logger });
+// ONE FIXTURE PER FIELD × WRONG-TYPE ARM.
+//
+// Each entry replaces exactly ONE field of an otherwise-valid payload with a
+// value that is PRESENT (not `undefined`) but WRONG-TYPED / empty. This is the
+// key distinguishing set: a lazy implementation that validates mere PRESENCE
+// (`field !== undefined`) instead of real type + non-emptiness checks would
+// happily push these records, so it goes RED here. The `undefined`-only
+// "missing field" tests above cannot catch that class on their own.
+//
+// Values chosen so each also probes the SPECIFIC validator:
+//   - "" defeats non-empty-string checks that a `typeof === "string"` alone passes.
+//   - {} / {home:"x"} defeat a shallow `typeof === "object"` odds check (empty
+//     record, and a keyed record whose value is not a finite number).
+//   - null defeats a presence check (null !== undefined) for both odds arms.
+//   - a numeric string / boolean for timestamp defeats a coerce-y check.
+const WRONG_TYPED: Array<{ field: string; value: unknown; note: string }> = [
+  { field: "eventType", value: "", note: "empty string" },
+  { field: "eventType", value: 5, note: "number" },
+  { field: "eventType", value: null, note: "null" },
+  { field: "matchId", value: 42, note: "number" },
+  { field: "matchId", value: "", note: "empty string" },
+  { field: "matchId", value: null, note: "null" },
+  { field: "oddsBefore", value: "1.9", note: "numeric string" },
+  { field: "oddsBefore", value: {}, note: "empty record" },
+  {
+    field: "oddsBefore",
+    value: { home: "high" },
+    note: "keyed record, non-number value",
+  },
+  { field: "oddsBefore", value: null, note: "null" },
+  { field: "oddsAfter", value: "2.1", note: "numeric string" },
+  { field: "oddsAfter", value: true, note: "boolean" },
+  { field: "oddsAfter", value: [], note: "array" },
+  { field: "oddsAfter", value: null, note: "null" },
+  { field: "timestamp", value: "1712574000000", note: "numeric string" },
+  { field: "timestamp", value: false, note: "boolean" },
+  { field: "timestamp", value: null, note: "null" },
+];
 
-  normalize({
-    data: JSON.stringify({
+for (const { field, value, note } of WRONG_TYPED) {
+  test(`skips-wrong-type-${field}-${note}: a present-but-wrong-typed ${field} (${note}) is skipped`, () => {
+    const { sink, received } = harness();
+    const logger = spyLogger();
+    const normalize = createNormalizer({ sink, logger });
+
+    const payload: Record<string, unknown> = {
       eventType: "odds_update",
-      matchId: 42, // wrong type -> not a valid matchId
+      matchId: "match-42",
       oddsBefore: 1.9,
       oddsAfter: 2.1,
       timestamp: 1712574000000,
-    }),
-  });
+    };
+    payload[field] = value;
 
-  assert.equal(received.length, 0, `wrong-typed matchId must be skipped`);
-  assert.equal(logger.calls.length, 1, `wrong-typed matchId must warn once`);
-});
+    assert.doesNotThrow(() => normalize({ data: JSON.stringify(payload) }));
+
+    assert.equal(
+      received.length,
+      0,
+      `wrong-typed ${field} (${note}) must push nothing, got ${received.length}`,
+    );
+    assert.equal(
+      logger.calls.length,
+      1,
+      `wrong-typed ${field} (${note}) must warn once, got ${logger.calls.length}`,
+    );
+  });
+}
