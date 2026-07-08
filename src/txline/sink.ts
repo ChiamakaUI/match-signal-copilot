@@ -10,7 +10,7 @@
  * slices (SSE client, normalizer) write into.
  */
 
-import type { Sink, Subscription } from "./types.ts";
+import type { Sink, Subscription } from "./types.js";
 
 /**
  * A single-consumer buffered async queue.

@@ -7,7 +7,7 @@
  * is machine-parseable from day one.
  */
 
-import { LOG_LEVELS, type LogLevel } from "./config.ts";
+import { LOG_LEVELS, type LogLevel } from "./config.js";
 
 /** Numeric severity per level, used for the emit threshold comparison. */
 const SEVERITY: Record<LogLevel, number> = {
