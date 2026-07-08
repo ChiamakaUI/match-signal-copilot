@@ -40,6 +40,63 @@ test("ignores-keepalive: comment lines produce no event and do not corrupt the f
   );
 });
 
+test("comment-only-frame: a data-less comment frame emits nothing and does not corrupt the next real frame", () => {
+  const parser = new SseParser();
+  // A `:`-comment line closed by a blank line is a COMPLETE frame that carries
+  // no `data:` field. The SSE dispatch algorithm emits nothing for it. This is
+  // the "produce no event" half of the keep-alive AC that a frame-sandwiched
+  // comment cannot prove: if dispatch fired on every blank line regardless of
+  // accumulated data, this standalone comment frame would wrongly emit {data:""}.
+  const afterComment = parser.write(": keep-alive ping\n\n");
+  assert.equal(
+    afterComment.length,
+    0,
+    `a data-less comment frame must emit nothing, got ${afterComment.length}: ${JSON.stringify(afterComment)}`,
+  );
+
+  // A bare `id:`-only frame (no data) likewise dispatches nothing per the spec.
+  const afterBareId = parser.write("id: 5\n\n");
+  assert.equal(
+    afterBareId.length,
+    0,
+    `a data-less id-only frame must emit nothing, got ${afterBareId.length}: ${JSON.stringify(afterBareId)}`,
+  );
+
+  // The real frame that follows must be entirely unaffected by the dropped frames.
+  const afterReal = parser.write("event: odds\ndata: real\nid: 7\n\n");
+  assert.equal(
+    afterReal.length,
+    1,
+    `expected exactly 1 real event, got ${afterReal.length}`,
+  );
+  assert.deepEqual(
+    afterReal[0],
+    { event: "odds", data: "real", id: "7" },
+    "the real frame following data-less frames must parse cleanly",
+  );
+});
+
+test("no-cross-frame-leak: a later frame omitting event/id does not inherit the prior frame's", () => {
+  const parser = new SseParser();
+  // Frame 1 carries a distinct event name AND id. Frame 2 supplies ONLY data,
+  // omitting both event and id. A parser that fails to reset eventName/id on
+  // dispatch leaks "first"/"100" into frame 2 — a core streaming-parser bug that
+  // every same-value multi-frame test misses.
+  const events = parser.write("event: first\ndata: a\nid: 100\n\ndata: b\n\n");
+
+  assert.equal(events.length, 2, `expected 2 events, got ${events.length}`);
+  assert.deepEqual(
+    events[0],
+    { event: "first", data: "a", id: "100" },
+    "frame 1 keeps its own event/id",
+  );
+  assert.deepEqual(
+    events[1],
+    { data: "b" },
+    "frame 2 omits event/id and must NOT inherit frame 1's 'first'/'100'",
+  );
+});
+
 test("partial-chunk: a frame split mid-field parses to exactly one event after the second chunk", () => {
   const parser = new SseParser();
 
