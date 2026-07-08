@@ -339,6 +339,177 @@ test("e2e-backoff -> reconnect delay is computed from the INJECTED backoff confi
   assert.equal(received[0]?.matchId, "m-77");
 });
 
+test("production defaults -> omitted config reads env config; omitted logger emits structured stdout; delivered end-to-end", async () => {
+  // Exercises the PRODUCTION fallbacks `deps.config ?? loadTxlineConfig()` and
+  // `deps.logger ?? createLogger(...)` — both omitted here. `connect` is omitted
+  // too, so the whole default composition root runs; only the external `fetch`
+  // boundary is stubbed.
+  const sink = new EventEmitterSink<NormalizedMatchEvent>();
+  const received: NormalizedMatchEvent[] = [];
+  sink.subscribe((e) => received.push(e));
+
+  // DISTINCT env-derived config: a hard-coded config fallback would connect to a
+  // DIFFERENT url/token, so this url/token equality goes RED under that bug.
+  const ENV_URL = "https://env-derived-feed.example/odds";
+  const ENV_TOKEN = "env-derived-token-42";
+  const savedUrl = process.env.TXLINE_SSE_URL;
+  const savedToken = process.env.TXLINE_AUTH_TOKEN;
+  process.env.TXLINE_SSE_URL = ENV_URL;
+  process.env.TXLINE_AUTH_TOKEN = ENV_TOKEN;
+
+  const fetchCalls: Array<{ url: string; headers: Record<string, string> }> =
+    [];
+  const originalFetch = globalThis.fetch;
+
+  // Capture stdout to prove the DEFAULT logger (real createLogger, not a noop)
+  // actually writes a structured JSON line — a noop-logger fallback writes none.
+  const stdoutLines: string[] = [];
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  const capturingWrite = ((chunk: unknown) => {
+    stdoutLines.push(String(chunk));
+    return true;
+  }) as typeof process.stdout.write;
+
+  function bodyFor(text: string): ReadableStream<Uint8Array> {
+    const bytes = new TextEncoder().encode(text);
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+  }
+
+  let ingestion!: ReturnType<typeof startTxlineIngestion>;
+  globalThis.fetch = (async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
+    fetchCalls.push({
+      url: String(input),
+      headers: (init?.headers ?? {}) as Record<string, string>,
+    });
+    ingestion.stop();
+    return new Response(bodyFor(VALID_FRAME), { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    process.stdout.write = capturingWrite;
+    ingestion = startTxlineIngestion(sink, {
+      backoff: { baseMs: 1, capMs: 1 },
+      sleep: async () => {},
+      // config, logger, connect ALL omitted -> full production defaults.
+    });
+    await ingestion.done;
+  } finally {
+    process.stdout.write = originalWrite;
+    globalThis.fetch = originalFetch;
+    if (savedUrl === undefined) delete process.env.TXLINE_SSE_URL;
+    else process.env.TXLINE_SSE_URL = savedUrl;
+    if (savedToken === undefined) delete process.env.TXLINE_AUTH_TOKEN;
+    else process.env.TXLINE_AUTH_TOKEN = savedToken;
+  }
+
+  // config fallback: loadTxlineConfig() read OUR env values, not any baked-in default.
+  assert.equal(
+    fetchCalls[0]?.url,
+    ENV_URL,
+    `omitted config must load TXLINE_SSE_URL from env, got ${fetchCalls[0]?.url}`,
+  );
+  assert.equal(
+    fetchCalls[0]?.headers["Authorization"],
+    `Bearer ${ENV_TOKEN}`,
+    `omitted config must load TXLINE_AUTH_TOKEN from env, got ${fetchCalls[0]?.headers["Authorization"]}`,
+  );
+
+  // logger fallback: the default createLogger emitted a structured JSON line.
+  const logLine = stdoutLines.find((l) =>
+    l.includes("txline connection closed"),
+  );
+  assert.ok(
+    logLine !== undefined,
+    `default logger must emit the connection-closed info line to stdout; captured ${JSON.stringify(stdoutLines)}`,
+  );
+  const parsed = JSON.parse(logLine!) as Record<string, unknown>;
+  assert.equal(
+    parsed.level,
+    "info",
+    `default logger line must be structured JSON at info level, got ${JSON.stringify(parsed)}`,
+  );
+  assert.equal(
+    parsed.msg,
+    "txline connection closed; will reconnect",
+    `default logger msg must match the client's info line, got ${String(parsed.msg)}`,
+  );
+
+  // and the real default pipeline delivered the scripted record end-to-end.
+  assert.equal(
+    received.length,
+    1,
+    `real default pipeline must deliver the scripted record, got ${received.length}`,
+  );
+  assert.equal(received[0]?.matchId, "m-77");
+});
+
+test("production default sleep -> omitted sleep uses the real setTimeout-backed clock, honoring the computed backoff ms", async () => {
+  // Exercises the `deps.sleep ?? realSleep` fallback: `sleep` is OMITTED so the
+  // reconnect delay flows through the real realSleep -> setTimeout. We spy on
+  // the global timer (firing fast) and CAPTURE the requested delay.
+  const sink = new EventEmitterSink<NormalizedMatchEvent>();
+  const received: NormalizedMatchEvent[] = [];
+  sink.subscribe((e) => received.push(e));
+
+  const sleepMs: number[] = [];
+  const originalSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((
+    fn: (...a: unknown[]) => void,
+    ms?: number,
+    ...rest: unknown[]
+  ) => {
+    sleepMs.push(ms ?? -1);
+    return originalSetTimeout(fn, 0, ...rest);
+  }) as typeof setTimeout;
+
+  let connects = 0;
+  let ingestion!: ReturnType<typeof startTxlineIngestion>;
+  try {
+    ingestion = startTxlineIngestion(sink, {
+      config: CONFIG,
+      logger: noopLogger,
+      backoff: { baseMs: 9, capMs: 999, factor: 4 },
+      // sleep OMITTED -> exercises the realSleep default.
+      connect: (_req: ConnectRequest) => {
+        connects += 1;
+        if (connects === 1) {
+          // First connection drops immediately (empty stream) -> reconnect.
+          return { chunks: chunkStream() };
+        }
+        // Reconnect delivers the frame then stops the loop.
+        ingestion.stop();
+        return { chunks: chunkStream(VALID_FRAME) };
+      },
+    });
+    await ingestion.done;
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+
+  // The single reconnect's delay = min(cap, base*factor^0) = 9. A no-op default
+  // sleep (no setTimeout call -> []), an ms-ignoring realSleep (-> [0]), or a
+  // dropped backoff (client default -> [1000]) each make this deepEqual RED.
+  assert.deepEqual(
+    sleepMs,
+    [9],
+    `omitted sleep must invoke setTimeout via realSleep with the computed backoff ms (9), got ${JSON.stringify(sleepMs)}`,
+  );
+  assert.equal(
+    received.length,
+    1,
+    `pipeline must resume after the real-clock backoff, got ${received.length}`,
+  );
+  assert.equal(received[0]?.matchId, "m-77");
+});
+
 test("fetchConnect throws on a non-ok HTTP status (status error branch is exercised)", async () => {
   const req: ConnectRequest = { url: CONFIG.sseUrl, headers: {} };
   const originalFetch = globalThis.fetch;
