@@ -11,9 +11,9 @@
 
 import { fileURLToPath } from "node:url";
 
-import { loadConfig } from "./config.ts";
-import { createLogger } from "./logger.ts";
-import { startServer, type RunningServer } from "./server.ts";
+import { loadConfig } from "./config.js";
+import { createLogger } from "./logger.js";
+import { startServer, type RunningServer } from "./server.js";
 
 /**
  * Build the production dependencies from the environment and start the HTTP

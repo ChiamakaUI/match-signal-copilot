@@ -12,8 +12,8 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 
-import type { AppConfig } from "./config.ts";
-import type { Logger } from "./logger.ts";
+import type { AppConfig } from "./config.js";
+import type { Logger } from "./logger.js";
 
 /** Dependencies the server is composed from (injected by the entrypoint). */
 export interface ServerDeps {
