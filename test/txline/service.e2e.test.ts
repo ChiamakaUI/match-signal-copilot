@@ -1,0 +1,551 @@
+/**
+ * End-to-end wiring test for the TxLINE ingestion service.
+ *
+ * These tests drive a SCRIPTED SSE byte stream through the REAL wired pipeline
+ * (`startTxlineIngestion` builds the real client + real SSE parser + real
+ * normalizer) — the ONLY injected collaborators are the network boundary
+ * (`connect`) and the clock (`sleep`). Nothing about the pipeline internals is
+ * faked, so a placeholder/stub composition root turns these RED.
+ */
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  startTxlineIngestion,
+  fetchConnect,
+} from "../../src/txline/service.ts";
+import { EventEmitterSink } from "../../src/txline/sink.ts";
+import type { Logger } from "../../src/logger.ts";
+import type { ConnectRequest } from "../../src/txline/client.ts";
+import type { NormalizedMatchEvent } from "../../src/txline/types.ts";
+
+/** A logger that records nothing — used where log output is not asserted. */
+const noopLogger: Logger = {
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
+  log() {},
+};
+
+/** Build an async chunk stream that yields the given chunks then ends (drops). */
+async function* chunkStream(
+  ...chunks: Array<string | Uint8Array>
+): AsyncIterable<string | Uint8Array> {
+  for (const chunk of chunks) yield chunk;
+}
+
+const CONFIG = {
+  sseUrl: "https://feed.example/odds-stream",
+  authToken: "secret-token-abc",
+} as const;
+
+/**
+ * A scripted SSE frame with EVERY wire feature the AC calls for:
+ *   - a keep-alive comment line (must be ignored),
+ *   - an `id:` (must resume the stream),
+ *   - an `event:` name,
+ *   - a MULTI-LINE `data:` payload (joined with `\n` before JSON.parse).
+ * Each normalized field carries a DISTINCT, recognisable value so a swapped or
+ * dropped field mapping is visible.
+ */
+const VALID_FRAME =
+  ": keep-alive\n" +
+  "id: 1001\n" +
+  "event: odds_update\n" +
+  'data: {"eventType":"odds_update",\n' +
+  'data: "matchId":"m-77",\n' +
+  'data: "oddsBefore":1.5,"oddsAfter":2.25,"timestamp":1700000000123}\n' +
+  "\n";
+
+test("end-to-end -> sink receives the normalized record whose fields equal the scripted frame's values", async () => {
+  const sink = new EventEmitterSink<NormalizedMatchEvent>();
+  const received: NormalizedMatchEvent[] = [];
+  sink.subscribe((e) => received.push(e));
+
+  let ingestion!: ReturnType<typeof startTxlineIngestion>;
+  ingestion = startTxlineIngestion(sink, {
+    config: CONFIG,
+    logger: noopLogger,
+    backoff: { baseMs: 1, capMs: 1 },
+    sleep: async () => {},
+    connect: (_req: ConnectRequest) => {
+      // Deliver the scripted frame once, then stop so the loop exits.
+      ingestion.stop();
+      return { chunks: chunkStream(VALID_FRAME) };
+    },
+  });
+
+  await ingestion.done;
+
+  assert.equal(
+    received.length,
+    1,
+    `expected exactly 1 normalized record, got ${received.length}`,
+  );
+  const rec = received[0]!;
+  assert.equal(
+    rec.eventType,
+    "odds_update",
+    `eventType must equal scripted value, got ${rec.eventType}`,
+  );
+  assert.equal(
+    rec.matchId,
+    "m-77",
+    `matchId must equal scripted value, got ${rec.matchId}`,
+  );
+  assert.equal(
+    rec.oddsBefore,
+    1.5,
+    `oddsBefore must equal scripted value, got ${rec.oddsBefore}`,
+  );
+  assert.equal(
+    rec.oddsAfter,
+    2.25,
+    `oddsAfter must equal scripted value, got ${rec.oddsAfter}`,
+  );
+  assert.equal(
+    rec.timestamp,
+    1700000000123,
+    `timestamp must equal scripted value, got ${rec.timestamp}`,
+  );
+});
+
+test("e2e-skips-bad -> sink count equals the valid-frame count, not the total frame count", async () => {
+  const sink = new EventEmitterSink<NormalizedMatchEvent>();
+  const received: NormalizedMatchEvent[] = [];
+  sink.subscribe((e) => received.push(e));
+
+  const warnings: string[] = [];
+  const logger: Logger = {
+    ...noopLogger,
+    warn: (msg) => warnings.push(msg),
+  };
+
+  // Three frames: valid, MALFORMED (invalid JSON), valid. The bad one must be
+  // skipped-and-logged while BOTH surrounding valid frames reach the sink.
+  const secondValid =
+    'id: 1002\ndata: {"eventType":"match_start","matchId":"m-88",' +
+    '"oddsBefore":3,"oddsAfter":4,"timestamp":1700000000999}\n\n';
+  const malformed = "id: bad\ndata: {not-json,,,}\n\n";
+
+  let ingestion!: ReturnType<typeof startTxlineIngestion>;
+  ingestion = startTxlineIngestion(sink, {
+    config: CONFIG,
+    logger,
+    backoff: { baseMs: 1, capMs: 1 },
+    sleep: async () => {},
+    connect: (_req: ConnectRequest) => {
+      ingestion.stop();
+      return { chunks: chunkStream(VALID_FRAME + malformed + secondValid) };
+    },
+  });
+
+  await ingestion.done;
+
+  // Three frames in; exactly TWO (the valid ones) reach the sink.
+  assert.equal(
+    received.length,
+    2,
+    `sink count must equal valid-frame count (2), not total (3); got ${received.length}`,
+  );
+  assert.deepEqual(
+    received.map((r) => r.matchId),
+    ["m-77", "m-88"],
+    `only the two valid frames may reach the sink, got ${JSON.stringify(received.map((r) => r.matchId))}`,
+  );
+  // The malformed frame must have been surfaced (logged), not silently dropped.
+  assert.ok(
+    warnings.length >= 1,
+    "the malformed frame must be logged at warn (skip-and-log)",
+  );
+});
+
+test("e2e-reconnect -> records received after the drop and Last-Event-ID header equals the pre-drop id", async () => {
+  const sink = new EventEmitterSink<NormalizedMatchEvent>();
+  const received: NormalizedMatchEvent[] = [];
+  sink.subscribe((e) => received.push(e));
+  const requests: ConnectRequest[] = [];
+
+  const postDrop =
+    'id: 2002\ndata: {"eventType":"odds_update","matchId":"m-post",' +
+    '"oddsBefore":5,"oddsAfter":6,"timestamp":1700000001000}\n\n';
+
+  let ingestion!: ReturnType<typeof startTxlineIngestion>;
+  ingestion = startTxlineIngestion(sink, {
+    config: CONFIG,
+    logger: noopLogger,
+    backoff: { baseMs: 1, capMs: 1 },
+    sleep: async () => {},
+    connect: (req: ConnectRequest) => {
+      requests.push(req);
+      if (requests.length === 1) {
+        // First connection: deliver the valid frame (id 1001) then DROP.
+        return { chunks: chunkStream(VALID_FRAME) };
+      }
+      // Reconnect: deliver one more record, then stop the loop.
+      ingestion.stop();
+      return { chunks: chunkStream(postDrop) };
+    },
+  });
+
+  await ingestion.done;
+
+  assert.ok(
+    requests.length >= 2,
+    `a drop must trigger a reconnect, got ${requests.length} connects`,
+  );
+  // The FIRST connection must NOT carry a resume header (nothing seen yet).
+  assert.equal(
+    requests[0]?.headers["Last-Event-ID"],
+    undefined,
+    "first connect must NOT carry Last-Event-ID",
+  );
+  // The reconnect must resume from the id seen before the drop.
+  assert.equal(
+    requests[1]?.headers["Last-Event-ID"],
+    "1001",
+    `reconnect must carry Last-Event-ID=1001, got ${requests[1]?.headers["Last-Event-ID"]}`,
+  );
+  // Records were delivered on BOTH sides of the drop, end-to-end.
+  assert.deepEqual(
+    received.map((r) => r.matchId),
+    ["m-77", "m-post"],
+    `records must be delivered before AND after the reconnect, got ${JSON.stringify(received.map((r) => r.matchId))}`,
+  );
+});
+
+test("default connect uses the real network boundary (fetch), not a no-op stub", async () => {
+  // Verify the PRODUCTION default: when `connect` is omitted, the service must
+  // open a real fetch-based SSE connection — not silently do nothing. We stub
+  // only the external `fetch` boundary and prove it is actually called with the
+  // configured URL + auth header, then feed one scripted frame back through the
+  // real pipeline.
+  const sink = new EventEmitterSink<NormalizedMatchEvent>();
+  const received: NormalizedMatchEvent[] = [];
+  sink.subscribe((e) => received.push(e));
+
+  const fetchCalls: Array<{ url: string; headers: Record<string, string> }> =
+    [];
+  const originalFetch = globalThis.fetch;
+
+  // A ReadableStream body carrying the scripted frame as UTF-8 bytes.
+  function bodyFor(text: string): ReadableStream<Uint8Array> {
+    const bytes = new TextEncoder().encode(text);
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+  }
+
+  let ingestion!: ReturnType<typeof startTxlineIngestion>;
+  globalThis.fetch = (async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
+    fetchCalls.push({
+      url: String(input),
+      headers: (init?.headers ?? {}) as Record<string, string>,
+    });
+    // Stop the loop so it does not reconnect after this scripted body ends.
+    ingestion.stop();
+    return new Response(bodyFor(VALID_FRAME), { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    ingestion = startTxlineIngestion(sink, {
+      config: CONFIG,
+      logger: noopLogger,
+      backoff: { baseMs: 1, capMs: 1 },
+      sleep: async () => {},
+      // connect deliberately omitted -> exercises the real default.
+    });
+    await ingestion.done;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.ok(
+    fetchCalls.length >= 1,
+    `default connect must call fetch, got ${fetchCalls.length} calls`,
+  );
+  assert.equal(
+    fetchCalls[0]?.url,
+    CONFIG.sseUrl,
+    `default connect must fetch the configured SSE URL, got ${fetchCalls[0]?.url}`,
+  );
+  assert.equal(
+    fetchCalls[0]?.headers["Authorization"],
+    `Bearer ${CONFIG.authToken}`,
+    "default connect must present the configured auth token",
+  );
+  // And the scripted body flowed through the REAL parser + normalizer to sink.
+  assert.equal(
+    received.length,
+    1,
+    `the real default pipeline must deliver the scripted record, got ${received.length}`,
+  );
+  assert.equal(received[0]?.matchId, "m-77");
+});
+
+test("e2e-backoff -> reconnect delay is computed from the INJECTED backoff config (base, then base*factor)", async () => {
+  // The service forwards `deps.backoff` into the real client, which computes the
+  // reconnect delay as min(cap, base * factor^attempt). Drive two empty (drop)
+  // connections so the loop reconnects twice, and capture the exact `ms` handed
+  // to `sleep`. If the service dropped `backoff` (or forwarded a hard-coded
+  // value) the client would fall back to its 1000ms/factor-2 defaults and the
+  // captured delays would be [1000, 2000], not [7, 21] — so this goes RED.
+  const sink = new EventEmitterSink<NormalizedMatchEvent>();
+  const received: NormalizedMatchEvent[] = [];
+  sink.subscribe((e) => received.push(e));
+
+  const delays: number[] = [];
+
+  let ingestion!: ReturnType<typeof startTxlineIngestion>;
+  ingestion = startTxlineIngestion(sink, {
+    config: CONFIG,
+    logger: noopLogger,
+    backoff: { baseMs: 7, capMs: 999, factor: 3 },
+    sleep: async (ms: number) => {
+      delays.push(ms);
+    },
+    connect: (_req: ConnectRequest) => {
+      // First two connects drop immediately (empty stream) -> backoff grows.
+      // The third delivers a real frame then stops the loop.
+      if (delays.length >= 2) {
+        ingestion.stop();
+        return { chunks: chunkStream(VALID_FRAME) };
+      }
+      return { chunks: chunkStream() };
+    },
+  });
+
+  await ingestion.done;
+
+  assert.deepEqual(
+    delays,
+    [7, 21],
+    `reconnect delays must be computed from the injected backoff (base=7, factor=3 -> [7,21]), got ${JSON.stringify(delays)}`,
+  );
+  // Sanity: the post-backoff connection still delivered end-to-end.
+  assert.equal(
+    received.length,
+    1,
+    `the frame delivered after backoff must reach the sink, got ${received.length}`,
+  );
+  assert.equal(received[0]?.matchId, "m-77");
+});
+
+test("production defaults -> omitted config reads env config; omitted logger emits structured stdout; delivered end-to-end", async () => {
+  // Exercises the PRODUCTION fallbacks `deps.config ?? loadTxlineConfig()` and
+  // `deps.logger ?? createLogger(...)` — both omitted here. `connect` is omitted
+  // too, so the whole default composition root runs; only the external `fetch`
+  // boundary is stubbed.
+  const sink = new EventEmitterSink<NormalizedMatchEvent>();
+  const received: NormalizedMatchEvent[] = [];
+  sink.subscribe((e) => received.push(e));
+
+  // DISTINCT env-derived config: a hard-coded config fallback would connect to a
+  // DIFFERENT url/token, so this url/token equality goes RED under that bug.
+  const ENV_URL = "https://env-derived-feed.example/odds";
+  const ENV_TOKEN = "env-derived-token-42";
+  const savedUrl = process.env.TXLINE_SSE_URL;
+  const savedToken = process.env.TXLINE_AUTH_TOKEN;
+  process.env.TXLINE_SSE_URL = ENV_URL;
+  process.env.TXLINE_AUTH_TOKEN = ENV_TOKEN;
+
+  const fetchCalls: Array<{ url: string; headers: Record<string, string> }> =
+    [];
+  const originalFetch = globalThis.fetch;
+
+  // Capture stdout to prove the DEFAULT logger (real createLogger, not a noop)
+  // actually writes a structured JSON line — a noop-logger fallback writes none.
+  const stdoutLines: string[] = [];
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  const capturingWrite = ((chunk: unknown) => {
+    stdoutLines.push(String(chunk));
+    return true;
+  }) as typeof process.stdout.write;
+
+  function bodyFor(text: string): ReadableStream<Uint8Array> {
+    const bytes = new TextEncoder().encode(text);
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+  }
+
+  let ingestion!: ReturnType<typeof startTxlineIngestion>;
+  globalThis.fetch = (async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
+    fetchCalls.push({
+      url: String(input),
+      headers: (init?.headers ?? {}) as Record<string, string>,
+    });
+    ingestion.stop();
+    return new Response(bodyFor(VALID_FRAME), { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    process.stdout.write = capturingWrite;
+    ingestion = startTxlineIngestion(sink, {
+      backoff: { baseMs: 1, capMs: 1 },
+      sleep: async () => {},
+      // config, logger, connect ALL omitted -> full production defaults.
+    });
+    await ingestion.done;
+  } finally {
+    process.stdout.write = originalWrite;
+    globalThis.fetch = originalFetch;
+    if (savedUrl === undefined) delete process.env.TXLINE_SSE_URL;
+    else process.env.TXLINE_SSE_URL = savedUrl;
+    if (savedToken === undefined) delete process.env.TXLINE_AUTH_TOKEN;
+    else process.env.TXLINE_AUTH_TOKEN = savedToken;
+  }
+
+  // config fallback: loadTxlineConfig() read OUR env values, not any baked-in default.
+  assert.equal(
+    fetchCalls[0]?.url,
+    ENV_URL,
+    `omitted config must load TXLINE_SSE_URL from env, got ${fetchCalls[0]?.url}`,
+  );
+  assert.equal(
+    fetchCalls[0]?.headers["Authorization"],
+    `Bearer ${ENV_TOKEN}`,
+    `omitted config must load TXLINE_AUTH_TOKEN from env, got ${fetchCalls[0]?.headers["Authorization"]}`,
+  );
+
+  // logger fallback: the default createLogger emitted a structured JSON line.
+  const logLine = stdoutLines.find((l) =>
+    l.includes("txline connection closed"),
+  );
+  assert.ok(
+    logLine !== undefined,
+    `default logger must emit the connection-closed info line to stdout; captured ${JSON.stringify(stdoutLines)}`,
+  );
+  const parsed = JSON.parse(logLine!) as Record<string, unknown>;
+  assert.equal(
+    parsed.level,
+    "info",
+    `default logger line must be structured JSON at info level, got ${JSON.stringify(parsed)}`,
+  );
+  assert.equal(
+    parsed.msg,
+    "txline connection closed; will reconnect",
+    `default logger msg must match the client's info line, got ${String(parsed.msg)}`,
+  );
+
+  // and the real default pipeline delivered the scripted record end-to-end.
+  assert.equal(
+    received.length,
+    1,
+    `real default pipeline must deliver the scripted record, got ${received.length}`,
+  );
+  assert.equal(received[0]?.matchId, "m-77");
+});
+
+test("production default sleep -> omitted sleep uses the real setTimeout-backed clock, honoring the computed backoff ms", async () => {
+  // Exercises the `deps.sleep ?? realSleep` fallback: `sleep` is OMITTED so the
+  // reconnect delay flows through the real realSleep -> setTimeout. We spy on
+  // the global timer (firing fast) and CAPTURE the requested delay.
+  const sink = new EventEmitterSink<NormalizedMatchEvent>();
+  const received: NormalizedMatchEvent[] = [];
+  sink.subscribe((e) => received.push(e));
+
+  const sleepMs: number[] = [];
+  const originalSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((
+    fn: (...a: unknown[]) => void,
+    ms?: number,
+    ...rest: unknown[]
+  ) => {
+    sleepMs.push(ms ?? -1);
+    return originalSetTimeout(fn, 0, ...rest);
+  }) as typeof setTimeout;
+
+  let connects = 0;
+  let ingestion!: ReturnType<typeof startTxlineIngestion>;
+  try {
+    ingestion = startTxlineIngestion(sink, {
+      config: CONFIG,
+      logger: noopLogger,
+      backoff: { baseMs: 9, capMs: 999, factor: 4 },
+      // sleep OMITTED -> exercises the realSleep default.
+      connect: (_req: ConnectRequest) => {
+        connects += 1;
+        if (connects === 1) {
+          // First connection drops immediately (empty stream) -> reconnect.
+          return { chunks: chunkStream() };
+        }
+        // Reconnect delivers the frame then stops the loop.
+        ingestion.stop();
+        return { chunks: chunkStream(VALID_FRAME) };
+      },
+    });
+    await ingestion.done;
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+
+  // The single reconnect's delay = min(cap, base*factor^0) = 9. A no-op default
+  // sleep (no setTimeout call -> []), an ms-ignoring realSleep (-> [0]), or a
+  // dropped backoff (client default -> [1000]) each make this deepEqual RED.
+  assert.deepEqual(
+    sleepMs,
+    [9],
+    `omitted sleep must invoke setTimeout via realSleep with the computed backoff ms (9), got ${JSON.stringify(sleepMs)}`,
+  );
+  assert.equal(
+    received.length,
+    1,
+    `pipeline must resume after the real-clock backoff, got ${received.length}`,
+  );
+  assert.equal(received[0]?.matchId, "m-77");
+});
+
+test("fetchConnect throws on a non-ok HTTP status (status error branch is exercised)", async () => {
+  const req: ConnectRequest = { url: CONFIG.sseUrl, headers: {} };
+  const originalFetch = globalThis.fetch;
+  // A non-ok status WITH a real (non-null) body: only the status guard can
+  // reject this, so deleting or inverting `!response.ok` makes the test RED.
+  globalThis.fetch = (async () =>
+    new Response("upstream unavailable", {
+      status: 503,
+      statusText: "Service Unavailable",
+    })) as typeof fetch;
+  try {
+    await assert.rejects(
+      () => fetchConnect(req),
+      (err: unknown) => err instanceof Error && /HTTP 503/.test(err.message),
+      "fetchConnect must throw on a non-ok status, naming the HTTP code",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("fetchConnect throws when an OK response has no body to stream (null-body branch)", async () => {
+  const req: ConnectRequest = { url: CONFIG.sseUrl, headers: {} };
+  const originalFetch = globalThis.fetch;
+  // status 200 (ok) but a NULL body: passes the status guard and must be
+  // rejected by the body===null guard. Deleting that guard makes this RED
+  // (it would instead resolve with `{ chunks: null }`).
+  globalThis.fetch = (async () =>
+    new Response(null, { status: 200 })) as typeof fetch;
+  try {
+    await assert.rejects(
+      () => fetchConnect(req),
+      (err: unknown) => err instanceof Error && /no body/.test(err.message),
+      "fetchConnect must throw when the OK response has no body",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
